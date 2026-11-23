@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Voting app behind an Application Load Balancer and an Auto Scaling group,
+  with the Polls table in Amazon DynamoDB. Instances use LabInstanceProfile
+  so they can call DynamoDB. Deleting this stack deletes the table, the load
+  balancer, the Auto Scaling group, and the instances. User data downloads
+  deploy/userdata.sh from your GitHub fork and runs it (edit REPO_URL there
+  and push before creating the stack).
+
+Parameters:
+  GitHubUsername:
+    Type: String
+    Description: >-
+      Your GitHub username. The stack downloads
+      https://raw.githubusercontent.com/<username>/voting-alb/main/deploy/userdata.sh
+      Push your REPO_URL edit to main before you create the stack.
+    AllowedPattern: "^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$"
+    ConstraintDescription: A GitHub username (letters, numbers, hyphens).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The default VPC. The load balancer and the target group use it.
+
+  SubnetIdA:
+    Type: AWS::EC2::Subnet::Id
+    Description: The default subnet in us-east-1a.
+
+  SubnetIdB:
+    Type: AWS::EC2::Subnet::Id
+    Description: The default subnet in us-east-1b.
+
+Resources:
+  PollsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Polls
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pollId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pollId
+          KeyType: HASH
+
+  BalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: voting-balancer-sg
+      GroupDescription: SG for the load balancer allowing HTTP.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: voting-instance-sg
+      GroupDescription: SG for Voting instances allowing SSH and HTTP from the load balancer.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt BalancerSecurityGroup.GroupId
+          Description: HTTP from the load balancer
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: voting-launch-template
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        InstanceType: t3.micro
+        KeyName: vockey
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt InstanceSecurityGroup.GroupId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            curl -fsSL "https://raw.githubusercontent.com/${GitHubUsername}/voting-alb/main/deploy/userdata.sh" \
+              -o /tmp/voting-userdata.sh
+            bash /tmp/voting-userdata.sh
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: voting-target-group
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      TargetType: instance
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: voting-load-balancer
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !GetAtt BalancerSecurityGroup.GroupId
+      Subnets:
+        - !Ref SubnetIdA
+        - !Ref SubnetIdB
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - PollsTable
+      - Listener
+    Properties:
+      AutoScalingGroupName: voting-auto-scaling
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref SubnetIdA
+        - !Ref SubnetIdB
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: DNS name of the load balancer. Open http:// and this name.
+    Value: !GetAtt LoadBalancer.DNSName
